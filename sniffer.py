@@ -16,13 +16,15 @@ import io
 import sqlite3
 from bluetoothctl import Bluetoothctl
 from threading import Thread
-
-interface=""
-
+from contextlib import closing
+interface= ""
+location= ""
 found_APs = []
 gps_lat = ""
 gps_lon = ""
+show_output = True
 OUIMEM = {}
+
 with open('OUI.txt', 'r', encoding="UTF-8") as OUILookup:
     for line in csv.reader(OUILookup, delimiter='\t'):
         if not line or line[0] == "#":
@@ -99,6 +101,48 @@ def check_root():
         print("This script requires sudo privileges")
         exit(1)
 
+def get_gps_coord():
+    with serial.Serial('/dev/ttyUSB0', baudrate=4800, timeout=1) as ser:
+        while True: 
+            line = ser.readline().decode('ascii', errors='replace')
+            if line.startswith("$GPGGA"):
+                gpsval = pynmea2.parse(line)
+                return gpsval
+
+def set_gps_coordinates():
+    while True:
+        gps_coord = get_gps_coord()
+        #TODO: fix gps logic. put in its own function only executed each 1 second. maybe diff
+        if gps_coord.latitude != 0.0 or gps_coord.longitude != 0.0:
+            global gps_lat
+            gps_lat = str(gps_coord.latitude)
+            global gps_lon
+            gps_lon = str(gps_coord.longitude)
+        time.sleep(60)
+
+def find_mac_vendor(mac_addr):
+    vendor=""
+    clientOUI = mac_addr[:8]
+    firstOctet = clientOUI[:2]
+    scale = 16
+    num_of_bits = 8
+
+    #needs a valid mac address
+    binaryRep = str(bin(int(firstOctet, scale))[2:].zfill(num_of_bits))
+    if OUIMEM.get(clientOUI) is not None:
+        identifiers = len(OUIMEM[clientOUI])
+        if identifiers == 2:
+            vendor=(str(OUIMEM[clientOUI][1]).replace(',', '').title())
+        else:
+            if identifiers == 1:
+                vendor=(str(OUIMEM[clientOUI][0]).replace(',', '').title())
+    else:
+        if binaryRep[6:7] == '1':
+            vendor=('Locally Assigned')
+        else:
+            vendor=('Unknown')
+    return vendor
+
 #you need to check every channel (1-13)
 def sniff_wifi_APs(packet):
 
@@ -109,8 +153,7 @@ def sniff_wifi_APs(packet):
         if mac_address not in found_APs:
 
             ssid = packet[Dot11Elt].info.decode()
-            gps_coord = get_gps_coord()
-
+            
             try:
                 dbm_signal = packet.dBm_AntSignal
             except:
@@ -124,29 +167,26 @@ def sniff_wifi_APs(packet):
             tmpvar1 = packet.getlayer(RadioTap).time
             time_stamp = datetime.fromtimestamp(tmpvar1).strftime("%Y-%m-%d %H:%M:%S")
 
-            if gps_coord.latitude != 0.0 or gps_coord.longitude != 0.0:
-                global gps_lat
-                gps_lat = str(gps_coord.latitude)
-                global gps_lon
-                gps_lon = str(gps_coord.longitude)
+            if(show_output):
+                print("###################################################")
+                print("AP Mac: " + str(mac_address))
+                print("SSID: " + ssid)
+                print("Vendor: " + str(vendor))
+                print("Channel: " + str(channelz))
+                print("Crypto: " + str(crypto))
+                print("Signal: " + str(dbm_signal) + "dBm")
+                print("Longitude: " + str(gps_lon))
+                print("Latitude: " + str(gps_lat))
+                print("Timestamp: " + str(time_stamp))
+                print("")
 
-            print("AP Mac: " + str(mac_address))
-            print("SSID: " + ssid)
-            print("Vendor: " + str(vendor))
-            print("Channel: " + str(channelz))
-            print("Crypto: " + str(crypto))
-            print("Signal: " + str(dbm_signal) + "dBm")
-            print("Longitude: " + str(gps_lon))
-            print("Latitude: " + str(gps_lat))
-            print("Timestamp: " + str(time_stamp))
-            print("###################################################")
-            print("")
             found_APs.append(mac_address)
+            with closing(sqlite3.connect("osint.db")) as connection:
+                with closing(connection.cursor()) as cursor:
+                    cursor.execute("insert into accessPoints (date_added, mac_address, mac_address_vendor, ssid, signal, longitude, latitude, location) values (?, ?, ?, ?, ?, ?, ?, ?)", (time_stamp, mac_address, vendor, ssid, dbm_signal, gps_lon, gps_lat, location))
+                    connection.commit()
 
 def sniff_wifi_probes(packet):
-    con = sqlite3.connect('osint.db')
-
-    cur = con.cursor()
     try:
         if packet.haslayer(Dot11ProbeReq):
             if packet.type == 0 and packet.subtype == 4:#subtype used to be 8 (APs) but is now 4 (Probe Requests)
@@ -162,30 +202,55 @@ def sniff_wifi_probes(packet):
                 chanfreq = get_channel(packet[RadioTap].ChannelFrequency)
 
                 if not (ssid == ""):
-                    #cur.execute("insert into wifi (date_added, mac, mac_vendor, ssid, signal, gps_coordinates, location) values (?, ?, ?, ?, ?, ?, ?)", (dt, mac, vendor, ssid, rssi, "", "home"))
-                    #con.commit()
-                    print("==========================================WIFI PROBE==========================")
-                    print("%s | Device MAC: %s | Vendor: %s | SSID: %s | %s dBm | Frequency: %s | Latitude: %s | Longitude: %s" % (dt, mac, vendor, ssid, rssi, chanfreq, gps_lat, gps_lon))
-                    print("==============================================================================")
+                    #type = request or response (from AP)
+                    with closing(sqlite3.connect("osint.db")) as connection:
+                        with closing(connection.cursor()) as cursor:
+                            cursor.execute("insert into wifiProbeRequests (date_added, mac_address, mac_address_vendor, ssid, signal, location, longitude, latitude) values (?, ?, ?, ?, ?, ?, ?, ?)", (dt, mac, vendor, ssid, rssi, gps_lon, gps_lat, location))
+                            connection.commit()
+                    if(show_output):
+                        print("========================WIFI PROBE REQUEST====================================")
+                        print("%s | Device MAC: %s | Vendor: %s | SSID: %s | %s dBm | Frequency: %s | Latitude: %s | Longitude: %s" % (dt, mac, vendor, ssid, rssi, chanfreq, gps_lat, gps_lon))
+                        print("==============================================================================")
 
     except UnicodeDecodeError as unicode_decode_err:
             # The ESSID is not a valid UTF-8 string.
             #raise TypeError from unicode_decode_err
         pass
 
-def sniff_bluetooth_data(packet):
+    if packet.haslayer(Dot11ProbeResp):
+        client_mac = str(packet.addr1)
+        client_vendor=find_mac_vendor(client_mac)
 
-    #fix having to open a diff db instance. Can cause locks
-    con = sqlite3.connect('osint.db')
-    cur = con.cursor()
+        ap_mac = str(packet.addr2)
+        ap_mac_vendor = find_mac_vendor(ap_mac)
 
-    #this should be on a seperate thread because it scans for 5 or 10 seconds for devices
+        ssid = str(packet.info.decode("utf-8"))
+        timestamp = packet.getlayer(RadioTap).time
+        dt = str(datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"))
+        rssi = str(packet[RadioTap].dBm_AntSignal)
+
+        #chanfreq is currently the channel the wifi card is on from this device and not the signal's chanfreq
+        chanfreq = get_channel(packet[RadioTap].ChannelFrequency)
+
+        if not (ssid == ""):
+            #type = request or response (from AP)
+            with closing(sqlite3.connect("osint.db")) as connection:
+                with closing(connection.cursor()) as cursor:
+                    cursor.execute("insert into wifiProbeResponses (date_added, client_mac_address, client_mac_address_vendor, ap_mac_address, ap_mac_address_vendor, ssid, signal, longitude, latitude, location) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dt, client_mac, client_vendor, ap_mac, ap_mac_vendor, ssid, rssi,gps_lon, gps_lat, location))
+                    connection.commit()
+            if(show_output):
+                print("*************************WIFI PROBE Response**************************************")
+                print("%s | Device MAC: %s | Client MAC: %s | SSID: %s | %s dBm | Frequency: %s | Latitude: %s | Longitude: %s" % (dt, client_mac, ap_mac, ssid, rssi, chanfreq, gps_lat, gps_lon))
+                print("**********************************************************************************")
+
+def sniff_bluetooth_data():
+
     while True:
         database_column_list = ['Name','Alias','UUID','RSSI']
         bt = Bluetoothctl()
         bt.start_scan()
-        #give 5 seconds to scan
-        for i in range(1, 6):
+        #give 10 seconds to scan
+        for i in range(1, 10):
             time.sleep(1)
 
         kev = []
@@ -219,7 +284,6 @@ def sniff_bluetooth_data(packet):
                     tmp.update({name : value})
             kev.append(tmp)
 
-
         for d in kev:
             
             name = ""
@@ -248,63 +312,29 @@ def sniff_bluetooth_data(packet):
 
             mac_address = d['mac_address']
 
-            #cur.execute("insert into bluetooth (name, mac_address, alias, uuid, rssi, date_added, gps_coordinates, location) values (?, ?, ?, ?, ?, ?, ?, ?)", (name, mac_address, alias, uuid, rssi, date_added, gps_coordinates, location))
-            #con.commit()
-            print("==============Bluetooth device====================")
-            print("Timestamp: " + date_added)
-            print("Name: " + str(name))
-            print("RSSI: " + str(rssi))
-            print("Alias: " + str(alias))
-            print("UUID: " + uuid)
-            print("MAC: " + mac_address)
-            print("Longitude: " + gps_lon)
-            print("Latitude: " + gps_lat)
+            with closing(sqlite3.connect("osint.db")) as connection:
+                with closing(connection.cursor()) as cursor:
+                    cursor.execute("insert into bluetoothDevices (name, mac_address, alias, uuid, rssi, date_added, longitude, latitude, location) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", (name, mac_address, alias, uuid, rssi, date_added, gps_lon, gps_lat, location))
+                    connection.commit()
+            if(show_output):
+                print("==============Bluetooth device====================")
+                print("Timestamp: " + date_added)
+                print("Name: " + str(name))
+                print("RSSI: " + str(rssi))
+                print("Alias: " + str(alias))
+                print("UUID: " + uuid)
+                print("MAC: " + mac_address)
+                print("Longitude: " + gps_lon)
+                print("Latitude: " + gps_lat)
 
-        time.sleep(10)
-
-def find_mac_vendor(mac_addr):
-    vendor=""
-    clientOUI = mac_addr[:8]
-    firstOctet = clientOUI[:2]
-    scale = 16
-    num_of_bits = 8
-
-    #needs a valid mac address
-    binaryRep = str(bin(int(firstOctet, scale))[2:].zfill(num_of_bits))
-    if OUIMEM.get(clientOUI) is not None:
-        identifiers = len(OUIMEM[clientOUI])
-        if identifiers == 2:
-            vendor=(str(OUIMEM[clientOUI][1]).replace(',', '').title())
-        else:
-            if identifiers == 1:
-                vendor=(str(OUIMEM[clientOUI][0]).replace(',', '').title())
-    else:
-        if binaryRep[6:7] == '1':
-            vendor=('Locally Assigned')
-        else:
-            vendor=('Unknown')
-    return vendor
-
-def get_gps_coord():
-    with serial.Serial('/dev/ttyUSB0', baudrate=4800, timeout=1) as ser:
-        while True: 
-            line = ser.readline().decode('ascii', errors='replace')
-            if line.startswith("$GPGGA"):
-                gpsval = pynmea2.parse(line)
-                return gpsval
+        #at home scan every 1 minutes
+        #make list of known adresses and stop doing stuff maybe? instead of a 10s timer.
+        time.sleep(30)
 
 def sniffpackets(packet):
     
-    if(True):
-        sniff_wifi_APs(packet)
-        #sniff_wifi_probes(packet)
-
-        bt = Thread(target=sniff_bluetooth_data, args=(packet))
-        bt.daemon = True
-        bt.start()
-
-    else:
-        print("ok")
+    sniff_wifi_APs(packet)
+    sniff_wifi_probes(packet)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
@@ -315,12 +345,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--interface', '-i', default='wlan1',
                 help='monitor mode enabled interface')
+    parser.add_argument('--location', '-l', default='home',
+                help='description of sniffing location')
     args = parser.parse_args()
 
-    if not args.interface:
-        print("You must specify an interface in monitor mode")
+    #if not args.interface:
+    #    print("You must specify an interface in monitor mode")
 
     interface = args.interface
+    location = args.location
 
     setup_monitor(interface)
 
@@ -328,11 +361,17 @@ if __name__ == "__main__":
     channel_changer.daemon = True
     channel_changer.start()
 
-    print("Sniffing on interface " + str(interface) + "...\n")
-    sniff(iface=interface, prn=sniffpackets, store=0)
-    
-    #probe scanner had monitor
-    #sniff(iface=interface, prn=sniffPackets, store=0, monitor=True)
+    bt = Thread(target=sniff_bluetooth_data)
+    bt.daemon = True
+    bt.start()
+
+    gps_location = Thread(target=set_gps_coordinates)
+    gps_location.daemon = True
+    gps_location.start()
+
+    print("Sniffing WIFI on " + str(interface) + "...\n")
+    sniff(iface=interface, prn=sniffpackets, store=0, monitor=True)
+
     while 1:
         time.sleep(1)
 
