@@ -13,12 +13,15 @@ import serial
 import pytz
 import pynmea2
 import io
+import sqlite3
+from bluetoothctl import Bluetoothctl
 from threading import Thread
 
 interface=""
 
 found_APs = []
-
+gps_lat = ""
+gps_lon = ""
 OUIMEM = {}
 with open('OUI.txt', 'r', encoding="UTF-8") as OUILookup:
     for line in csv.reader(OUILookup, delimiter='\t'):
@@ -27,47 +30,38 @@ with open('OUI.txt', 'r', encoding="UTF-8") as OUILookup:
         else:
             OUIMEM[line[0]] = line[1:]
 
-def rssi(radiodata):
-    if 'dBm_AntSignal=' in radiodata:
-        start = radiodata.find('dBm_AntSignal=')
-        return str(radiodata[start+14:start+21]).replace(' ','').replace('A','')
+def get_channel(freq):
+    
+    if freq == 2412:
+        return '01'
+    if freq == 2417:
+        return '02'
+    if freq == 2422:
+        return '03'
+    if freq == 2427:
+        return '04'
+    if freq == 2432:
+        return '05'
+    if freq == 2437:
+        return '06'
+    if freq == 2442:
+        return '07'
+    if freq == 2447:
+        return '08'
+    if freq == 2452:
+        return '09'
+    if freq == 2457:
+        return '10'
+    if freq == 2462:
+        return '11'
+    if freq == 2467:
+        return '12'
+    if freq == 2472:
+        return '13'
+    if freq == 2484:
+        return '14'
     else:
-        return '-255dBm'
-
-def channel(radiodata):
-    if 'Channel=' in radiodata:
-        start = radiodata.find('Channel=')
-        freq = int(radiodata[start+8:start+12])
-        if freq == 2412:
-            return 'C:01 ' + str(freq)
-        if freq == 2417:
-            return 'C:02 ' + str(freq)
-        if freq == 2422:
-            return 'C:03 ' + str(freq)
-        if freq == 2427:
-            return 'C:04 ' + str(freq)
-        if freq == 2432:
-            return 'C:05 ' + str(freq)
-        if freq == 2437:
-            return 'C:06 ' + str(freq)
-        if freq == 2442:
-            return 'C:07 ' + str(freq)
-        if freq == 2447:
-            return 'C:08 ' + str(freq)
-        if freq == 2452:
-            return 'C:09 ' + str(freq)
-        if freq == 2457:
-            return 'C:10 ' + str(freq)
-        if freq == 2462:
-            return 'C:11 ' + str(freq)
-        if freq == 2467:
-            return 'C:12 ' + str(freq)
-        if freq == 2472:
-            return 'C:13 ' + str(freq)
-        if freq == 2484:
-            return 'C:14 ' + str(freq)
-        else:
-            return '-->>' + str(freq)
+        return ''
                     
 #Function to handle Crtl+C
 def signal_handler(signal, frame):
@@ -105,12 +99,11 @@ def check_root():
         print("This script requires sudo privileges")
         exit(1)
 
+#you need to check every channel (1-13)
 def sniff_wifi_APs(packet):
 
     if packet.haslayer(Dot11Beacon):
 
-        gps_lat = ""
-        gps_lon = ""
         mac_address = packet[Dot11].addr2
 
         if mac_address not in found_APs:
@@ -128,9 +121,13 @@ def sniff_wifi_APs(packet):
             crypto = stats.get("crypto")
 
             vendor = find_mac_vendor(mac_address)
-            
+            tmpvar1 = packet.getlayer(RadioTap).time
+            time_stamp = datetime.fromtimestamp(tmpvar1).strftime("%Y-%m-%d %H:%M:%S")
+
             if gps_coord.latitude != 0.0 or gps_coord.longitude != 0.0:
+                global gps_lat
                 gps_lat = str(gps_coord.latitude)
+                global gps_lon
                 gps_lon = str(gps_coord.longitude)
 
             print("AP Mac: " + str(mac_address))
@@ -141,15 +138,129 @@ def sniff_wifi_APs(packet):
             print("Signal: " + str(dbm_signal) + "dBm")
             print("Longitude: " + str(gps_lon))
             print("Latitude: " + str(gps_lat))
+            print("Timestamp: " + str(time_stamp))
             print("###################################################")
             print("")
             found_APs.append(mac_address)
 
 def sniff_wifi_probes(packet):
-    print("")
+    con = sqlite3.connect('osint.db')
+
+    cur = con.cursor()
+    try:
+        if packet.haslayer(Dot11ProbeReq):
+            if packet.type == 0 and packet.subtype == 4:#subtype used to be 8 (APs) but is now 4 (Probe Requests)
+
+                mac = str(packet.addr2)
+                ssid = str(packet.info.decode("utf-8"))
+                timestamp = packet.getlayer(RadioTap).time
+                dt = str(datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"))
+                rssi = str(packet[RadioTap].dBm_AntSignal)
+                vendor = find_mac_vendor(mac)
+
+                #chanfreq is currently the channel the wifi card is on from this device and not the signal's chanfreq
+                chanfreq = get_channel(packet[RadioTap].ChannelFrequency)
+
+                if not (ssid == ""):
+                    #cur.execute("insert into wifi (date_added, mac, mac_vendor, ssid, signal, gps_coordinates, location) values (?, ?, ?, ?, ?, ?, ?)", (dt, mac, vendor, ssid, rssi, "", "home"))
+                    #con.commit()
+                    print("==========================================WIFI PROBE==========================")
+                    print("%s | Device MAC: %s | Vendor: %s | SSID: %s | %s dBm | Frequency: %s | Latitude: %s | Longitude: %s" % (dt, mac, vendor, ssid, rssi, chanfreq, gps_lat, gps_lon))
+                    print("==============================================================================")
+
+    except UnicodeDecodeError as unicode_decode_err:
+            # The ESSID is not a valid UTF-8 string.
+            #raise TypeError from unicode_decode_err
+        pass
 
 def sniff_bluetooth_data(packet):
-    print("")
+
+    #fix having to open a diff db instance. Can cause locks
+    con = sqlite3.connect('osint.db')
+    cur = con.cursor()
+
+    #this should be on a seperate thread because it scans for 5 or 10 seconds for devices
+    while True:
+        database_column_list = ['Name','Alias','UUID','RSSI']
+        bt = Bluetoothctl()
+        bt.start_scan()
+        #give 5 seconds to scan
+        for i in range(1, 6):
+            time.sleep(1)
+
+        kev = []
+        available_devices = bt.get_available_devices()
+
+        for device in available_devices:
+            mac_address = device['mac_address']
+
+            #get info from bluetoothctl
+            device_info = bt.get_device_info(mac_address)
+
+            #filteredDevices = []
+            #filteredDevices.append({"mac_address" : mac_address})
+            uuidCounter = 0
+            #loop through all properties of device
+            tmp = {}
+            tmp.update({"mac_address" : mac_address})
+            for s in range(len(device_info)): 
+                #split device name and value
+                info = device_info[s].strip().split(":")
+                try:
+                    name = info[0].strip()
+                    value = info[1].strip()
+                except:
+                    value = "NONE"
+                if(name == "UUID"):
+                    uuidCounter = uuidCounter + 1
+                if(uuidCounter > 1):
+                    continue
+                if(name in database_column_list):
+                    tmp.update({name : value})
+            kev.append(tmp)
+
+
+        for d in kev:
+            
+            name = ""
+            rssi = "0"
+            alias = ""
+            uuid = ""
+            gps_coordinates = ""
+            location = "home"
+            date_added = str(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+            if(d.__contains__("Name")):
+                name = d['Name']
+            if(d.__contains__("Alias")):
+                alias = d['Alias']
+            if(d.__contains__("UUID")):
+                uuid = d['UUID'].split("(")[0].strip()
+            if(d.__contains__("RSSI")):
+                rssi = d['RSSI'].strip()
+
+            if name == "" :
+                name = alias
+            
+            #do we need this?
+            if rssi == "" :
+                rssi = "0"
+
+            mac_address = d['mac_address']
+
+            #cur.execute("insert into bluetooth (name, mac_address, alias, uuid, rssi, date_added, gps_coordinates, location) values (?, ?, ?, ?, ?, ?, ?, ?)", (name, mac_address, alias, uuid, rssi, date_added, gps_coordinates, location))
+            #con.commit()
+            print("==============Bluetooth device====================")
+            print("Timestamp: " + date_added)
+            print("Name: " + str(name))
+            print("RSSI: " + str(rssi))
+            print("Alias: " + str(alias))
+            print("UUID: " + uuid)
+            print("MAC: " + mac_address)
+            print("Longitude: " + gps_lon)
+            print("Latitude: " + gps_lat)
+
+        time.sleep(10)
 
 def find_mac_vendor(mac_addr):
     vendor=""
@@ -171,7 +282,7 @@ def find_mac_vendor(mac_addr):
         if binaryRep[6:7] == '1':
             vendor=('Locally Assigned')
         else:
-            vendor=('Unknown OUI')
+            vendor=('Unknown')
     return vendor
 
 def get_gps_coord():
@@ -187,7 +298,11 @@ def sniffpackets(packet):
     if(True):
         sniff_wifi_APs(packet)
         #sniff_wifi_probes(packet)
-        #sniff_bluetooth_data(packet)
+
+        bt = Thread(target=sniff_bluetooth_data, args=(packet))
+        bt.daemon = True
+        bt.start()
+
     else:
         print("ok")
 
@@ -215,6 +330,11 @@ if __name__ == "__main__":
 
     print("Sniffing on interface " + str(interface) + "...\n")
     sniff(iface=interface, prn=sniffpackets, store=0)
+    
+    #probe scanner had monitor
+    #sniff(iface=interface, prn=sniffPackets, store=0, monitor=True)
+    while 1:
+        time.sleep(1)
 
 
 
